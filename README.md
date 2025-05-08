@@ -36,13 +36,7 @@ Where:
 
 #### Inverse Kinematics
 
-For a 2-DOF planar robot arm with link lengths l1 and l2, the inverse kinematics solution is:
-
-```
-cos(θ2) = (x² + y² - l1² - l2²) / (2*l1*l2)
-θ2 = ±arccos(cos(θ2))
-θ1 = atan2(y, x) - atan2(l2*sin(θ2), l1 + l2*cos(θ2))
-```
+Use Isaac Lab built in Differential IK controller.
 
 ## Running the Project
 
