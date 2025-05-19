@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-
+#
 """
 PID Controller Module
 ====================
-Implementation of a PID controller for robot joint control.
+This is dead code, use if manual implementation of PID controller is needed.
 """
 
 import time
@@ -78,7 +78,7 @@ class PIDController:
         # Calculate the derivative term
         derivative = (error - self.prev_error) / dt
         
-        # Calculate output
+        #  output is weighted sum of the three terms
         output = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
         
         # Apply output limits if specified

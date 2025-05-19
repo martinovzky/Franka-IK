@@ -1,288 +1,323 @@
-#!/usr/bin/env python3
-
-"""
-Franka Research Arm Control with PID & Inverse Kinematics
-========================================================
-Main script that demonstrates Franka Research robotic arm control with PID 
-controllers and inverse kinematics in Isaac Sim.
-"""
-
 import numpy as np
-import math
-import time
-import os
-import sys
+import argparse
 
-# Import our custom modules from the flattened structure
+# Import Isaac Lab components when running on VM
+try:
+    from omni.isaac.lab import App, SimulationContext
+    from omni.isaac.lab.robots import FrankaRobot
+    from omni.isaac.lab.utils import VisualizationUtils
+    from omni.isaac.lab.utils import RecordHelper
+    from omni.isaac.lab.motion import CartesianPath, CubicPolynomial
+    ISAAC_LAB_AVAILABLE = True
+except ImportError:
+    print("Isaac Lab not available, running in compatibility mode")
+    ISAAC_LAB_AVAILABLE = False
+    # Fall back to standard Isaac Sim imports
+    from omni.isaac.kit import SimulationApp
+    from omni.isaac.core import World
+    from omni.isaac.franka import Franka
+    from omni.isaac.core.articulations import ArticulationView
+
+# Import our custom controllers
 from controllers.pid_controller import PIDController
-from ik.franka_kinematics import FrankaArmKinematics
+from controllers.isaac_controller import IsaacDiffIKController
 
-# These imports will be used when running in Isaac Sim
-# Commented out for local development, uncomment when running on the VM
-"""
-import omni
-from omni.isaac.kit import SimulationApp
-import omni.isaac.core.utils.numpy as np_utils
-from omni.isaac.core.robots import Robot
-from omni.isaac.core.articulations import ArticulationView
-from omni.isaac.core.utils.rotations import euler_angles_to_quat
-from omni.isaac.core.utils.types import ArticulationAction
-from omni.isaac.core import World
-"""
-
-class FrankaArmController:
-    """
-    High-level controller for a Franka Research arm using PID control and kinematics.
-    
-    Attributes:
-        kinematics: FrankaArmKinematics instance
-        pid_controllers: List of PID controllers for each joint
-        current_joint_positions: Current joint positions
-        target_joint_positions: Target joint positions
-    """
-    
-    def __init__(self, joint_limits=None, pid_params=None):
-        """
-        Initialize the Franka arm controller.
-        
-        Args:
-            joint_limits: List of (min, max) joint limits for each joint
-            pid_params: List of (kp, ki, kd) tuples for PID controllers
-        """
-        # Initialize kinematics
-        self.kinematics = FrankaArmKinematics(joint_limits)
-        
-        # Default PID parameters if not specified
-        if pid_params is None:
-            # Different PID parameters for each joint
-            pid_params = [
-                (100.0, 1.0, 10.0),  # Joint 1
-                (100.0, 1.0, 10.0),  # Joint 2
-                (100.0, 1.0, 10.0),  # Joint 3
-                (100.0, 1.0, 10.0),  # Joint 4
-                (50.0, 0.5, 5.0),    # Joint 5
-                (50.0, 0.5, 5.0),    # Joint 6
-                (20.0, 0.1, 2.0)     # Joint 7
-            ]
-        
-        # Initialize PID controllers for each joint
-        self.pid_controllers = []
-        for kp, ki, kd in pid_params:
-            self.pid_controllers.append(PIDController(kp, ki, kd, output_limits=(-50.0, 50.0)))
-        
-        # Initialize joint states
-        self.current_joint_positions = self.kinematics.joint_angles.copy()
-        self.target_joint_positions = self.kinematics.joint_angles.copy()
-    
-    def set_target_end_effector_position(self, position, orientation=None):
-        """
-        Set target end-effector position and compute required joint positions.
-        
-        Args:
-            position: Target (x, y, z) position
-            orientation: Target orientation (optional)
-            
-        Returns:
-            bool: True if IK solution found, False otherwise
-        """
-        # Solve inverse kinematics
-        solution = self.kinematics.inverse_kinematics_numerical(
-            position, 
-            orientation, 
-            self.current_joint_positions
-        )
-        
-        if solution is not None:
-            self.target_joint_positions = solution
-            return True
-        
-        return False
-    
-    def update_control(self, dt=0.01):
-        """
-        Update joint control based on PID controllers.
-        
-        Args:
-            dt: Time step
-            
-        Returns:
-            list: Joint torques/forces to apply
-        """
-        joint_actions = []
-        
-        for i in range(self.kinematics.num_joints):
-            # Compute control action using PID
-            control_action = self.pid_controllers[i].compute(
-                self.target_joint_positions[i],
-                self.current_joint_positions[i],
-                dt
-            )
-            
-            joint_actions.append(control_action)
-        
-        return joint_actions
-    
-    def update_joint_positions(self, joint_positions):
-        """
-        Update the current joint positions.
-        
-        Args:
-            joint_positions: New joint positions
-        """
-        self.current_joint_positions = joint_positions
+# Import our custom kinematics and IK
+from ik.franka_kinematics import FrankaKinematics
+from ik.inverse_kinematics_solver import IKSolver
 
 
-def isaac_sim_setup():
-    """
-    Set up the Isaac Sim environment with a Franka Panda arm.
-    This would be used on the VM.
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description="Franka arm control with Isaac Lab")
+    parser.add_argument("--headless", action="store_true", help="Run in headless mode")
+    parser.add_argument("--record", action="store_true", help="Record simulation")
+    parser.add_argument("--duration", type=float, default=10.0, help="Simulation duration in seconds (for recording)")
+    return parser.parse_args()
+
+
+def run_isaac_lab_mode():
+    """Run the simulation using Isaac Lab (higher-level API)"""
+    # Parse args
+    args = parse_args()
+    print(f"Running with Isaac Lab (Recording: {'ON' if args.record else 'OFF'})")
     
-    Returns:
-        tuple: (world, franka) objects for simulation
-    """
-    # This is a placeholder for Isaac Sim setup
-    # When running on the VM, this would be filled in with actual code
+    # Initialize Isaac Lab application with viewport settings
+    app = App({
+        "headless": args.headless,
+        "width": 1280,
+        "height": 720,
+        "window_title": "Franka Robot Control - Isaac Lab Mode"
+    })
     
-    """
-    # Create a World instance
-    world = World()
-    
-    # Set physics parameters
-    world.set_solver_type("PGS")
-    world.set_physics_dt(1.0/120.0)
-    world.set_rendering_dt(1.0/60.0)
-    
-    # Add a ground plane
-    world.scene.add_default_ground_plane()
-    
-    # Add a Franka Panda robot
-    franka_asset_path = "/Isaac/Robots/Franka/franka_instanceable.usd"
-    franka_position = [0, 0, 0]
-    franka_orientation = [0, 0, 0]
-    
-    # Convert Euler angles to quaternion
-    franka_quat = euler_angles_to_quat(franka_orientation)
-    
-    # Add the robot to the scene
-    franka = world.scene.add(
-        Robot(
-            prim_path="/World/Franka",
-            name="franka",
-            usd_path=franka_asset_path,
-            position=franka_position,
-            orientation=franka_quat
-        )
+    # Create simulation context, equivalent to World in Isaac Sim
+    sim_context = SimulationContext(
+        physics_dt=1.0/120.0,
+        rendering_dt=1.0/60.0,
+        stage_units_in_meters=1.0
     )
     
-    # Initialize the simulation
+    # Simple recording setup if enabled
+    if args.record:
+        # Create output directory
+        import os
+        record_dir = os.path.join(os.path.expanduser("~"), "Desktop", "franka_recordings")
+        os.makedirs(record_dir, exist_ok=True)
+        
+        # Initialize the built-in RecordHelper - just one line!
+        recorder = RecordHelper(
+            output_dir=record_dir,
+            frame_rate=30
+        )
+        
+        # Start recording
+        print(f"Recording enabled. Output will be saved to: {record_dir}")
+        recorder.start_recording()
+    
+    # Add a ground plane
+    sim_context.add_ground_plane(z_position=0.0)
+    
+    # Add Franka robot
+    franka = FrankaRobot(
+        prim_path="/World/Franka",
+        name="franka", 
+        position=[0, 0, 0]
+    )
+    sim_context.add_articulation(franka)
+    
+    # Setup camera to view the scene
+    from omni.isaac.lab.utils import ViewportHelper
+    viewport_helper = ViewportHelper()
+    viewport_helper.set_camera_view(
+        eye=[1.5, 1.5, 1.0],
+        target=[0.0, 0.0, 0.3],
+        up=[0, 0, 1]
+    )
+    
+    # Enable shadows and better rendering
+    from omni.isaac.lab.utils import RenderProductHelper
+    render_product = RenderProductHelper()
+    render_product.enable_shadows()
+    
+    # Replace the PID controller setup and IK solving with the DifferentialIKController
+    print("Setting up Differential IK Controller...")
+    controller = IsaacDiffIKController(
+        robot=franka,
+        damping=0.05,
+        command_type="position"  # "position" is more intuitive than "velocity"
+    )
+
+    # Reset simulation to settle physics
+    for _ in range(10):
+        sim_context.step()
+        
+    # =====================================================
+    # TASK 1: REACH THE TARGET POSITION
+    # =====================================================
+    
+    # Define the target position and orientation
+    target_position = np.array([0.5, 0.0, 0.4])
+    target_orientation = np.array([1.0, 0.0, 0.0, 0.0])  # quaternion w,x,y,z
+    
+    # Visualize the target position
+    VisualizationUtils.create_sphere(
+        scene=sim_context.scene,
+        position=target_position,
+        radius=0.02,
+        color=[0.0, 1.0, 0.0]  # Green sphere
+    )
+    
+    # Set the target for the controller
+    print("TASK 1: Moving to target position...")
+    controller.set_targets(
+        position=target_position,
+        orientation=target_orientation
+    )
+    
+    # Wait until the robot reaches the target position
+    target_reached = False
+    while app.is_running() and not target_reached:
+        dt = sim_context.get_physics_dt()
+        
+        # Apply control
+        controller.compute_and_apply_control(dt)
+        
+        # Check if target is reached
+        if controller.is_target_reached():
+            target_reached = True
+            print("TASK 1 COMPLETED: Target position reached!")
+            
+            # Optional: pause briefly at the target position
+            for _ in range(60):  # pause for ~0.5 seconds (60 frames at 120Hz)
+                controller.compute_and_apply_control(dt)
+                sim_context.step()
+        
+        sim_context.step()
+    
+    # =====================================================
+    # TASK 2: FOLLOW A SQUARE TRAJECTORY
+    # =====================================================
+    
+    # Define square parameters
+    square_center = [0.5, 0.0, 0.4]  # Same as target position
+    square_size = 0.2
+    time_per_segment = 2.0  # seconds
+    
+    # Define the square corners (5 points to close the square)
+    half_size = square_size / 2.0
+    square_points = [
+        [square_center[0], square_center[1] + half_size, square_center[2] + half_size],  # Top right
+        [square_center[0], square_center[1] - half_size, square_center[2] + half_size],  # Top left
+        [square_center[0], square_center[1] - half_size, square_center[2] - half_size],  # Bottom left
+        [square_center[0], square_center[1] + half_size, square_center[2] - half_size],  # Bottom right
+        [square_center[0], square_center[1] + half_size, square_center[2] + half_size]   # Back to top right
+    ]
+    
+    # Visualize the square
+    corner_colors = [
+        [0.0, 1.0, 0.0],   # Green
+        [1.0, 1.0, 0.0],   # Yellow
+        [1.0, 0.5, 0.0],   # Orange
+        [1.0, 0.0, 0.0],   # Red
+        [0.0, 1.0, 0.0]    # Green again
+    ]
+    
+    # Visualize corners
+    for i, point in enumerate(square_points):
+        VisualizationUtils.create_sphere(
+            scene=sim_context.scene,
+            position=point,
+            radius=0.015,
+            color=corner_colors[i]
+        )
+    
+    # Visualize connecting lines
+    for i in range(len(square_points) - 1):
+        VisualizationUtils.create_line(
+            scene=sim_context.scene,
+            start=square_points[i],
+            end=square_points[i + 1],
+            color=[0.0, 0.7, 1.0],  # Blue lines
+            thickness=0.004
+        )
+    
+    # Create a smooth trajectory using Isaac Lab's CartesianPath
+    segment_times = [time_per_segment] * (len(square_points) - 1)
+    square_trajectory = CartesianPath(
+        points=square_points,
+        time_spans=segment_times,
+        interpolation_type=CubicPolynomial()
+    )
+    
+    # Follow the square trajectory
+    print("TASK 2: Following square trajectory...")
+    sim_time = 0.0
+    total_trajectory_time = sum(segment_times)
+    
+    while app.is_running() and sim_time <= total_trajectory_time:
+        dt = sim_context.get_physics_dt()
+        
+        # Sample the trajectory at the current time
+        desired_pose = square_trajectory.get_pose_at_time(sim_time)
+        position = desired_pose.translation
+        orientation = desired_pose.quaternion()
+        
+        # Set target for controller
+        controller.set_targets(position=position, orientation=orientation)
+        
+        # Apply control
+        controller.compute_and_apply_control(dt)
+        
+        # Update simulation
+        sim_context.step()
+        sim_time += dt
+        
+        # Display progress
+        if int(sim_time) % 1 == 0 and int(sim_time * 10) % 10 == 0:  # Every second
+            completion = min(100.0, (sim_time / total_trajectory_time) * 100.0)
+            print(f"Square trajectory progress: {completion:.1f}%")
+    
+    print("TASK 2 COMPLETED: Square trajectory finished!")
+    
+    if args.record and 'recorder' in locals() and recorder is not None:
+        print("Finalizing recording...")
+        for _ in range(30): # Step a few more frames
+            sim_context.step()
+            if not app.is_running(): # Check if app closed during these steps
+                break
+    
+    # Cleanup
+    print("All tasks completed.")
+    app.close()
+
+
+def run_isaac_sim_mode():
+    """Run the simulation using standard Isaac Sim (original implementation)"""
+    print("Running with standard Isaac Sim")
+    
+    # Launch Isaac Sim
+    args = parse_args()
+    sim_app = SimulationApp({"headless": args.headless})
+    
+    # Create the world and add ground
+    world = World(stage_units_in_meters=1.0)
+    world.scene.add_default_ground_plane()
+    
+    # Spawn the Franka robot
+    franka = Franka(prim_path="/franka", name="franka")
+    
+    # Initialize views
+    art_view = ArticulationView(prim_paths_expr="/franka")
+    kin = FrankaKinematics(prim_paths_expr="/franka")
+    ik_solver = IKSolver(
+        prim_paths_expr="/franka",
+        end_effector_name=kin.ee_body
+    )
+    
+    # Reset world to initial state
     world.reset()
     
-    # Let the simulation run for a bit to let the robot settle
-    for _ in range(10):
+    # Create the controller
+    controller = IsaacDiffIKController(
+        robot=franka,
+        damping=0.05,
+        command_type="position"
+    )
+    
+    # Define target pose (unchanged)
+    target_position = np.array([0.5, 0.0, 0.4])
+    target_orientation = np.array([1.0, 0.0, 0.0, 0.0])  # quaternion w,x,y,z
+    
+    # Set the target
+    controller.set_targets(
+        position=target_position,
+        orientation=target_orientation
+    )
+    
+    # Main loop
+    while sim_app.is_running():
+        # Get dt
+        dt = world.get_physics_dt()
+        
+        # Apply control - single line replaces all the IK and PID computation
+        controller.compute_and_apply_control(dt)
+        
+        # Step the simulation
         world.step()
     
-    return world, franka
-    """
-    
-    return None, None
-
+    # Close the app
+    sim_app.close()
 
 def main():
     """
-    Main function to demonstrate Franka Research arm control.
-    For local testing, we'll simulate the robot movement without Isaac Sim.
+    Main entry point that chooses between Isaac Lab and Isaac Sim based on availability
     """
-    print("Franka Research Arm Control with PID & Inverse Kinematics")
-    
-    # Create Franka arm controller
-    controller = FrankaArmController()
-    
-    # Generate a square trajectory in 3D space
-    print("Generating square trajectory...")
-    
-    # Define square corners (x, y, z)
-    square_corners = [
-        (0.4, 0.0, 0.5),     # Front
-        (0.4, 0.4, 0.5),     # Right
-        (0.4, 0.4, 0.7),     # Right-up
-        (0.4, -0.4, 0.7),    # Left-up
-        (0.4, -0.4, 0.5),    # Left
-        (0.4, 0.0, 0.5)      # Back to front
-    ]
-    
-    # Simulation parameters
-    dt = 0.01  # Time step (10ms)
-    duration_per_segment = 3.0  # Time to move between corners
-    
-    # In a real simulation or with Isaac Sim, this would move the actual robot
-    # Here we just print out the trajectory and control signals
-    print("\nSimulating Franka arm movement...")
-    print("Time | Target Position (x,y,z) | Current Position (x,y,z) | Control Signal")
-    print("-" * 100)
-    
-    # Start with current position
-    current_pos = controller.kinematics.forward_kinematics_simple(controller.current_joint_positions)
-    
-    # For each segment of the trajectory
-    for i in range(len(square_corners) - 1):
-        start_corner = square_corners[i]
-        end_corner = square_corners[i+1]
-        
-        # Generate trajectory for this segment
-        trajectory = controller.kinematics.generate_trajectory(start_corner, end_corner, duration_per_segment, dt)
-        
-        # Follow the trajectory
-        for target_pos, time_point in trajectory:
-            # Set the target position
-            ik_success = controller.set_target_end_effector_position(target_pos)
-            
-            if not ik_success:
-                print(f"Warning: IK failed for position {target_pos}")
-                continue
-            
-            # Compute control action
-            control_signal = controller.update_control(dt)
-            
-            # In a real simulation, we would apply the control signal and update the position
-            # For this local simulation, we'll simulate the movement with a simple model
-            for j in range(controller.kinematics.num_joints):
-                # Simple dynamics: position changes based on control signal
-                controller.current_joint_positions[j] += control_signal[j] * dt * 0.001  # Scaled for simulation
-            
-            # Get current position after update
-            current_pos = controller.kinematics.forward_kinematics_simple(controller.current_joint_positions)
-            
-            # Print status every few steps
-            if int(time_point * 100) % 20 == 0:  # Print every 0.2 seconds
-                print(f"{time_point:.2f}s | ({target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}) | "
-                      f"({current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f}) | "
-                      f"{[f'{c:.2f}' for c in control_signal]}")
-    
-    print("\nTrajectory complete!")
+    if ISAAC_LAB_AVAILABLE:
+        run_isaac_lab_mode()
+    else:
+        run_isaac_sim_mode()
 
 
 if __name__ == "__main__":
-    # Check if we should run with Isaac Sim
-    use_isaac_sim = False
-    
-    if use_isaac_sim:
-        # This code would be uncommented when running on the VM
-        """
-        # Launch Isaac Sim
-        simulation_app = SimulationApp({"headless": False})
-        
-        # Setup the scene and robot
-        world, franka = isaac_sim_setup()
-        
-        # Run the main function
-        if world is not None and franka is not None:
-            # TODO: Implement Isaac Sim specific control code
-            pass
-        
-        # Cleanup
-        simulation_app.close()
-        """
-        pass
-    else:
-        # Run local simulation
-        main()
+    main()
+  
