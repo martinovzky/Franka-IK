@@ -1,13 +1,17 @@
 import numpy as np
 import argparse
+import torch
+import os
+import gymnasium
+from gymnasium.wrappers import RecordVideo
 
 from isaaclab.app import AppLauncher
-from isaaclab.sim import SimulationContext
+from isaaclab.sim import SimulationContext, SimulationCfg, PhysxCfg
+from isaaclab.assets import Articulation
 from isaaclab_assets.robots.franka import FRANKA_CFG
-from isaaclab.utils import VisualizationUtils, RecordHelper
-from isaaclab.utils import CartesianPath, CubicPolynomial
+from isaaclab.utils.math import quat_from_euler_xyz
+from isaaclab.terrains import TerrainImporter, TerrainImporterCfg
 
-# Import our custom controllers and kinematics
 from controllers.pid_controller import PIDController
 from controllers.isaac_controller import IsaacDiffIKController
 from ik.franka_kinematics import FrankaKinematics
@@ -18,98 +22,165 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Franka arm control with Isaac Lab")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode")
     parser.add_argument("--record", action="store_true", help="Record simulation")
-    parser.add_argument("--duration", type=float, default=10.0,
+    parser.add_argument("--duration", type=float, default=30.0,
                         help="Simulation duration in seconds (for recording)")
     return parser.parse_args()
 
 
-def run_isaac_lab_mode():
+def main():
     args = parse_args()
     print(f"Running Isaac Lab Mode (recording: {'ON' if args.record else 'OFF'})")
 
-    # Launch the app
-    app = AppLauncher(headless=args.headless, width=1280, height=720,
-                      window_title="Franka Robot Control").app
+    #launches the app with proper configuration
+    app_launcher = AppLauncher(
+        headless=args.headless,
+        width=1280,
+        height=720,
+        window_title="Franka Robot Control"
+    )
+    simulation_app = app_launcher.app
 
-    # Create simulation context
-    sim = SimulationContext(physics_dt=1/120.0, rendering_dt=1/60.0)
-
-    # Recording
+    #sets up recording using gymnasium.wrappers.RecordVideo - Isaac Lab 2.0 official method
+    video_recorder = None
     if args.record:
-        import os
-        out = os.path.join(os.path.expanduser("~"), "Desktop", "franka_recordings")
-        os.makedirs(out, exist_ok=True)
-        recorder = RecordHelper(output_dir=out, frame_rate=30)
-        recorder.start_recording()
-        print(f"Recording to: {out}")
+        record_dir = os.path.expanduser("~/Desktop/franka_recordings")
+        os.makedirs(record_dir, exist_ok=True)
+        
+        #creates a dummy environment for recording wrapper
+        class DummyEnv:
+            def __init__(self):
+                self.metadata = {"render_fps": 30}
+                
+        dummy_env = DummyEnv()
+        video_recorder = RecordVideo(
+            dummy_env,
+            video_folder=record_dir,
+            episode_trigger=lambda x: True,  #records every episode
+            name_prefix="franka_simulation"
+        )
+        print(f"Recording enabled using gymnasium.wrappers.RecordVideo")
+        print(f"Videos will be saved to: {record_dir}")
 
-    # Add ground plane
-    sim.add_ground_plane(z_position=0.0)
+    #configures simulation settings
+    sim_cfg = SimulationCfg(
+        dt=1/120.0,
+        render_interval=2,  #renders every 2 physics steps (60 FPS)
+        physx=PhysxCfg(
+            solver_type=1,  #TGS solver
+            use_gpu=True,
+        ),
+        physics_material=None,
+    )
 
-    # Spawn Franka via asset cfg
-    franka = FRANKA_CFG.replace(prim_path="/World/Franka").build()
-    sim.add_articulation(franka)
+    #creates simulation context
+    sim = SimulationContext(sim_cfg)
 
-    # Camera & rendering utilities
-    vis = VisualizationUtils(sim)
-    vis.set_camera(eye=[1.5,1.5,1.0], target=[0,0,0.3], up=[0,0,1])
-    vis.enable_shadows()
+    #creates ground plane configuration
+    terrain_cfg = TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="plane",
+        collision_group=-1,
+        physics_material=None,
+        visual_material=None,
+        debug_vis=False,
+    )
+    terrain = TerrainImporter(terrain_cfg)
 
-    # Controller and kinematics
+    #spawns Franka robot using Isaac Lab asset configuration
+    franka_cfg = FRANKA_CFG.replace(prim_path="/World/Franka")
+    franka = Articulation(franka_cfg)
+
+    #initializes simulation scene
+    sim.reset()
+
+    #starts recording if enabled
+    if video_recorder:
+        video_recorder.start_video_recorder()
+        print("Video recording started...")
+
+    #controller and kinematics setup
     kinematics = FrankaKinematics(prim_paths_expr="/World/Franka")
-    ik_solver = IKSolver(prim_paths_expr="/World/Franka")
-    controller = IsaacDiffIKController(robot=franka, damping=0.05, command_type="position")
+    ik_solver = IKSolver(prim_paths_expr="/World/Franka") 
+    controller = IsaacDiffIKController(robot=kinematics, damping=0.05, command_type="position")
 
-    # Reset and step
-    for _ in range(10): sim.step()
+    #resets and steps simulation for initialization
+    for _ in range(10):
+        sim.step()
+        if video_recorder:
+            video_recorder.capture_frame()
 
-    # TASK 1: reach target
-    target_pos = np.array([0.5,0.0,0.4])
-    target_ori = np.array([1.0,0.0,0.0,0.0])
-    vis.draw_sphere(position=target_pos, radius=0.02, color=[0,1,0])
+    #TASK 1: reach target position
+    target_pos = np.array([0.5, 0.0, 0.4])
+    target_ori = np.array([1.0, 0.0, 0.0, 0.0])  #identity quaternion
+    
+    #sets target for controller
     controller.set_targets(position=target_pos, orientation=target_ori)
 
+    print("Moving to target position...")
     reached = False
-    while app.is_running() and not reached:
-        dt = sim.get_physics_dt()
+    step_count = 0
+    max_steps = 1000  #safety limit
+    
+    while simulation_app.is_running() and not reached and step_count < max_steps:
+        dt = sim_cfg.dt
         controller.compute_and_apply_control(dt)
+        
         if controller.is_target_reached():
             reached = True
             print("Target reached!")
+        
         sim.step()
+        if video_recorder:
+            video_recorder.capture_frame()
+        step_count += 1
 
-    # TASK 2: square trajectory
-    center = [0.5,0.0,0.4]; size=0.2; T=2.0
+    #TASK 2: Square trajectory 
+    print("Following square trajectory...")
+    center = [0.5, 0.0, 0.4]
+    size = 0.2
+    T = 2.0  #time per segment
+    
+    #defines square corners
     pts = [
-        [center[0], center[1]+size/2, center[2]+size/2],    # Top right
-        [center[0], center[1]-size/2, center[2]+size/2],    # Top left  
-        [center[0], center[1]-size/2, center[2]-size/2],    # Bottom left
-        [center[0], center[1]+size/2, center[2]-size/2],    # Bottom right
-        [center[0], center[1]+size/2, center[2]+size/2]     # Back to top right
+        [center[0], center[1] + size/2, center[2] + size/2],    #top right
+        [center[0], center[1] - size/2, center[2] + size/2],    #top left  
+        [center[0], center[1] - size/2, center[2] - size/2],    #bottom left
+        [center[0], center[1] + size/2, center[2] - size/2],    #bottom right
     ]
-    traj = CartesianPath(points=pts[:-1], time_spans=[T]*4, interpolation_type=CubicPolynomial())
-    print("Following square...")
-    t=0
-    total=4*T
-    while app.is_running() and t<=total:
-        pose = traj.get_pose_at_time(t)
-        controller.set_targets(position=pose.translation,
-                                orientation=pose.quaternion())
-        dt = sim.get_physics_dt()
-        controller.compute_and_apply_control(dt)
-        sim.step(); t += dt
+    
+    #executes square trajectory with simple linear interpolation
+    for i, target_point in enumerate(pts):
+        print(f"Moving to corner {i+1}/4")
+        controller.set_targets(position=np.array(target_point), orientation=target_ori)
+        
+        #waits for target to be reached or timeout
+        reached = False
+        step_count = 0
+        max_steps = int(T / sim_cfg.dt)  #converts time to steps
+        
+        while simulation_app.is_running() and not reached and step_count < max_steps:
+            dt = sim_cfg.dt
+            controller.compute_and_apply_control(dt)
+            
+            if controller.is_target_reached():
+                reached = True
+                print(f"Corner {i+1} reached!")
+                break
+                
+            sim.step()
+            if video_recorder:
+                video_recorder.capture_frame()
+            step_count += 1
 
-    # Finalize recording
-    if args.record:
-        for _ in range(int(0.5/dt)): sim.step()
-        recorder.stop_recording()
-        print("Recording saved.")
-
-    app.close()
-
-
-def main():
-    run_isaac_lab_mode()
+    print("Square trajectory completed!")
+    
+    #stops recording and saves video
+    if video_recorder:
+        video_recorder.close_video_recorder()
+        print("Recording completed and saved using gymnasium.wrappers.RecordVideo")
+    
+    #closes simulation
+    simulation_app.close()
 
 
 if __name__ == "__main__":
