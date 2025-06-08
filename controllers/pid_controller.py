@@ -58,36 +58,36 @@ class PIDController:
         Returns:
             float: Control output
         """
-        # Calculate current error
+        #calculates current error
         error = setpoint - process_value
         
-        # Handle time delta
+        #handles time delta
         current_time = time.time()
         if self.last_time is None:
             self.last_time = current_time
         if dt is None:
             dt = current_time - self.last_time
         
-        # Ensure minimum time delta to avoid division by zero
+        #ensures minimum time delta to avoid division by zero
         dt = max(dt, 0.001)
         self.last_time = current_time
         
-        # Calculate the integral term with anti-windup
+        #calculates the integral term with anti-windup
         self.integral += error * dt
         
-        # Calculate the derivative term
+        #calculates the derivative term
         derivative = (error - self.prev_error) / dt
         
-        #  output is weighted sum of the three terms
+        #output is weighted sum of the three terms
         output = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
         
-        # Apply output limits if specified
+        #applies output limits if specified
         if self.output_limits[0] is not None and output < self.output_limits[0]:
             output = self.output_limits[0]
         elif self.output_limits[1] is not None and output > self.output_limits[1]:
             output = self.output_limits[1]
         
-        # Store error for next iteration
+        #stores error for next iteration
         self.prev_error = error
         
         return output
